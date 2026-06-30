@@ -177,12 +177,36 @@ struct thpool_* thpool_init(int num_threads){
 
 	/* Thread init */
 	int n;
+	
 	for (n=0; n<num_threads; n++){
 		thread_init(thpool_p, &thpool_p->threads[n], n);
 #if THPOOL_DEBUG
 			printf("THPOOL_DEBUG: Created thread %d in pool \n", n);
 #endif
 	}
+
+
+/*
+thread_create 只是请求操作系统创建新线程
+它立即返回，不会等待新线程真正启动
+新线程的启动由操作系统调度器控制
+从调用 pthread_create 到新线程真正执行 thread_do 函数之间有时间差
+
+主线程执行流程：
+thread_init() 
+  → pthread_create()  // 立即返回，但新线程还没启动
+  → pthread_detach()
+  → return 0
+ 
+新线程执行流程（异步）：
+操作系统调度
+  → thread_do() 函数开始执行
+    → 设置线程名称
+    → 注册信号处理器
+    → pthread_mutex_lock(&thpool_p->thcount_lock)
+    → thpool_p->num_threads_alive += 1  // 在这里才标记为存活
+    → pthread_mutex_unlock(&thpool_p->thcount_lock)
+*/
 
 	/* Wait for threads to initialize */
 	while (thpool_p->num_threads_alive != num_threads) {}
@@ -310,6 +334,8 @@ static int thread_init (thpool_* thpool_p, struct thread** thread_p, int id){
 	(*thread_p)->id       = id;
 
 	pthread_create(&(*thread_p)->pthread, NULL, (void * (*)(void *)) thread_do, (*thread_p));
+
+	//将线程标记为分离状态，使其在结束时自动释放资源，无需其他线程调用 pthread_join 来等待和回收
 	pthread_detach((*thread_p)->pthread);
 	return 0;
 }
@@ -332,6 +358,45 @@ static void thread_hold(int sig_id) {
 *
 * @param  thread        thread that will run this function
 * @return nothing
+*/
+
+/*
+线程启动
+    ↓
+设置线程名称
+    ↓
+注册信号处理器
+    ↓
+标记为存活状态 (num_threads_alive++)
+    ↓
+┌─────────────────────────────┐
+│  while(threads_keepalive)  │
+│         ↓                   │
+│  等待任务 (bsem_wait)       │ ← 阻塞点
+│         ↓                   │
+│  双重检查存活标志           │
+│         ↓                   │
+│  标记为工作状态             │
+│  (num_threads_working++)    │
+│         ↓                   │
+│  从队列获取任务             │
+│         ↓                   │
+│  执行任务函数               │ ← 用户代码执行
+│         ↓                   │
+│  释放任务内存               │
+│         ↓                   │
+│  标记为空闲状态             │
+│  (num_threads_working--)    │
+│         ↓                   │
+│  如果全部空闲，通知等待者   │
+│         ↓                   │
+└─────────────────────────────┘
+    ↓ (threads_keepalive == 0)
+退出循环
+    ↓
+减少存活计数 (num_threads_alive--)
+    ↓
+线程结束 (return NULL)
 */
 static void* thread_do(struct thread* thread_p){
 
@@ -371,7 +436,20 @@ static void* thread_do(struct thread* thread_p){
 	while(threads_keepalive){
 
 		bsem_wait(thpool_p->jobqueue.has_jobs);
-
+/*
+T1: 线程A 调用 bsem_wait()
+T2: 检查 bsem_p->v != 1 (true, v=0)
+T3: 进入 pthread_cond_wait (阻塞)
+T4: 主线程添加任务
+T5: 调用 jobqueue_push()
+T6: 调用 bsem_post(has_jobs)
+T7: has_jobs->v = 1
+T8: pthread_cond_signal() 唤醒线程A
+T9: 线程A 从 pthread_cond_wait 返回
+T10: 重新检查 has_jobs->v != 1 (false, v=1)
+T11: has_jobs->v = 0 (消费信号)
+T12: 线程A 继续执行，取出任务
+*/
 		if (threads_keepalive){
 
 			pthread_mutex_lock(&thpool_p->thcount_lock);
@@ -541,7 +619,30 @@ static void bsem_reset(bsem *bsem_p) {
 	bsem_init(bsem_p, 0);
 }
 
+/*
+bsem_post(semaphore)
+    ↓
+pthread_mutex_lock(&semaphore->mutex)
+    ↓
+semaphore->v = 1  // 标记有资源
+    ↓
+pthread_cond_signal(&semaphore->cond)  // 唤醒等待者
+    ↓
+pthread_mutex_unlock(&semaphore->mutex)
 
+T1: 工作线程A 调用 bsem_wait()
+T2: 检查 has_jobs->v != 1 (true, v=0)
+T3: 进入 pthread_cond_wait (阻塞)
+T4: 主线程添加任务
+T5: 调用 jobqueue_push()
+T6: 调用 bsem_post(has_jobs)
+T7: has_jobs->v = 1
+T8: pthread_cond_signal() 唤醒线程A
+T9: 线程A 从 pthread_cond_wait 返回
+T10: 重新检查 has_jobs->v != 1 (false, v=1)
+T11: has_jobs->v = 0 (消费信号)
+T12: 线程A 继续执行，取出任务
+*/
 /* Post to at least one thread */
 static void bsem_post(bsem *bsem_p) {
 	pthread_mutex_lock(&bsem_p->mutex);
@@ -564,6 +665,10 @@ static void bsem_post_all(bsem *bsem_p) {
 static void bsem_wait(bsem* bsem_p) {
 	pthread_mutex_lock(&bsem_p->mutex);
 	while (bsem_p->v != 1) {
+		//线程在调用 pthread_cond_wait 前必须持有 mutex，调用时会自动释放该锁
+		//被放入条件变量 cond 的等待队列中，进入阻塞状态。
+		//当其他线程发出条件变量信号时，线程被唤醒
+		//重新尝试获取锁（可能需等待其他线程释放锁），成功后才能继续执行
 		pthread_cond_wait(&bsem_p->cond, &bsem_p->mutex);
 	}
 	bsem_p->v = 0;
